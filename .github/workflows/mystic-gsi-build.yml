@@ -46,7 +46,7 @@ jobs:
             default-jre-headless curl build-essential cmake ninja-build pkg-config \
             perl golang-go libgtest-dev libusb-1.0-0-dev libpcre2-dev \
             libprotobuf-dev protobuf-compiler libbrotli-dev liblz4-dev libzstd-dev \
-            libarchive-tools openssl file
+            libarchive-tools openssl file zip
 
       - name: Install apktool
         run: |
@@ -189,9 +189,54 @@ jobs:
             cp "$SUPER_DIRECT" firmware_super.img
             echo "firmware_mode=super" >> "$GITHUB_ENV"
           else
-            echo "No payload.bin, .pac, Samsung AP tar, or super.img found. Full listing:"
-            find firmware_extracted -type f
-            exit 1
+            # Nothing matched by filename -- this usually means the download
+            # was a raw, generically-named file (e.g. "firmware.bin") that IS
+            # actually one of the supported types, it's just not named like
+            # one. Inspect the file's actual content before giving up.
+            echo "No file matched by name. Inspecting content of extracted file(s)..."
+            CANDIDATE=$(find firmware_extracted -maxdepth 1 -type f | head -n1)
+            if [ -z "$CANDIDATE" ]; then
+              echo "No files found in firmware_extracted at all."
+              exit 1
+            fi
+            CMIME=$(file -b "$CANDIDATE")
+            echo "Candidate file: $CANDIDATE"
+            echo "Candidate type: $CMIME"
+
+            case "$CMIME" in
+              *"Android sparse image"*|*"ext4 filesystem data"*|*[Ee][Rr][Oo][Ff][Ss]*|*F2FS*)
+                echo "Looks like a raw super/system filesystem image -- treating as super.img"
+                cp "$CANDIDATE" firmware_super.img
+                echo "firmware_mode=super" >> "$GITHUB_ENV"
+                ;;
+              *"POSIX tar archive"*|*"tar archive"*|*"USTAR"*)
+                echo "Looks like a tar archive -- treating as Samsung AP tar"
+                cp "$CANDIDATE" firmware_ap.tar
+                echo "firmware_mode=samsung" >> "$GITHUB_ENV"
+                ;;
+              *)
+                # A bare payload.bin has no distinctive magic bytes (it's a
+                # protobuf blob, "file" just reports "data") -- fall back to
+                # the filename as the only remaining signal.
+                case "$(basename "$CANDIDATE")" in
+                  *payload*)
+                    echo "Filename suggests this is a raw payload.bin -- wrapping it in a zip for MysticGSI"
+                    mkdir -p payload_wrap
+                    cp "$CANDIDATE" payload_wrap/payload.bin
+                    (cd payload_wrap && zip -0 -q -r ../firmware_input.zip payload.bin)
+                    echo "firmware_mode=payload" >> "$GITHUB_ENV"
+                    ;;
+                  *)
+                    echo "Could not identify firmware type. No payload.bin, .pac, Samsung AP tar, or super.img found."
+                    echo "Full listing:"
+                    find firmware_extracted -type f
+                    echo "file(1) output for the raw download and candidate:"
+                    file "$DL_FILE" "$CANDIDATE" || true
+                    exit 1
+                    ;;
+                esac
+                ;;
+            esac
           fi
 
       - name: Build GSI
@@ -252,14 +297,10 @@ jobs:
             fi
           done
 
-      - name: Prepare release tag
-        id: tag
-        run: echo "tag=gsi-${{ github.event.inputs.build_name }}-$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
-
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ github.event.inputs.build_name }}
           name: ${{ github.event.inputs.build_name }}
           body_path: out/${{ github.event.inputs.build_name }}/output.txt
           files: |
